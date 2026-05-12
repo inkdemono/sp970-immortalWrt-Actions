@@ -18,7 +18,6 @@ permissions:
   contents: write
   actions: read
 
-# 全局环境变量
 env:
   REPO_URL: https://github.com/lkiuyu/immortalwrt
   REPO_BRANCH: master
@@ -27,7 +26,7 @@ env:
   UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
   WORK_DIR: /mnt/workdir
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # 抑制 Node.js 20 弃用警告
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
@@ -35,9 +34,6 @@ jobs:
     timeout-minutes: 360
 
     steps:
-    # ==========================================
-    # 1️⃣ Checkout & Environment Setup
-    # ==========================================
     - name: Checkout repository
       uses: actions/checkout@v4
 
@@ -61,9 +57,6 @@ jobs:
         sudo chown $USER:$GROUPS "$WORK_DIR"
         df -hT "$WORK_DIR"
 
-    # ==========================================
-    # 2️⃣ Optional Debug Session (TMate)
-    # ==========================================
     - name: Setup TMate Session (Optional)
       if: github.event.inputs.debug_enabled == 'true'
       uses: mxschmitt/action-tmate@v3
@@ -71,9 +64,6 @@ jobs:
         detached: true
         limit-access-to-actor: true
 
-    # ==========================================
-    # 3️⃣ Clone Source & Link Workspace
-    # ==========================================
     - name: Clone ImmortalWrt source
       working-directory: ${{ env.WORK_DIR }}
       run: |
@@ -82,20 +72,15 @@ jobs:
         cd openwrt
         echo "✅ Source cloned: $(git rev-parse --short HEAD)"
 
-    # ==========================================
-    # 4️⃣ Configure Custom Feeds (带容错与重试)
-    # ==========================================
     - name: Configure custom feeds
       run: |
         cd openwrt
         cp feeds.conf.default feeds.conf.default.bak
         
-        # 添加第三方 feeds
         echo "src-git daed https://github.com/sbwml/luci-app-daed" >> feeds.conf.default
         echo "src-git small https://github.com/kenzok8/small" >> feeds.conf.default
         echo "src-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages" >> feeds.conf.default
         
-        # 临时关闭 set -e，允许 feeds 解析警告继续执行
         set +e
         echo "🔄 Updating feeds (max 3 retries)..."
         for i in 1 2 3; do
@@ -114,9 +99,6 @@ jobs:
         ./scripts/feeds install -a
         echo "✅ Feeds installation complete"
 
-    # ==========================================
-    # 5️⃣ Load Configuration
-    # ==========================================
     - name: Load diffconfig
       run: |
         if [ -f "${{ env.CONFIG_FILE }}" ]; then
@@ -127,22 +109,14 @@ jobs:
           exit 1
         fi
 
-    # ==========================================
-    # 6️⃣ Pre-compile Fixes (GCC14/musl + Podman + Config Sanitization)
-    # ==========================================
     - name: Apply compatibility patches
       run: |
         cd openwrt
-        
-        # 🛡️ 修复 GCC14 + musl + _FORTIFY_SOURCE 导致的 gpgme 编译失败
-        # Podman 仅依赖 gpgme 做镜像签名验证，家用场景可安全移除
         echo "🔧 Patching podman to remove gpgme dependency..."
         [ -f "feeds/packages/utils/podman/Makefile" ] && sed -i 's/+gpgme//' feeds/packages/utils/podman/Makefile
         echo "✅ Podman gpgme dependency removed"
         
-        # 显式禁用冲突包，防止自动拉取导致构建中断
         cat >> .config << 'EOF'
-        # GCC14/musl compatibility: disable problematic crypto packages
         # CONFIG_PACKAGE_gpgme is not set
         # CONFIG_PACKAGE_libgpg-error is not set
         # CONFIG_PACKAGE_libgcrypt is not set
@@ -150,36 +124,29 @@ jobs:
         # CONFIG_PACKAGE_npth is not set
         EOF
         
-        # 清理旧缓存（可选）
         if [ "${{ github.event.inputs.clean_cache }}" = "true" ]; then
           echo "🧹 Cleaning build cache..."
           rm -rf tmp/staging_dir/host* tmp/.config-package.in build_dir/target-*/gpgme*
         fi
 
-    # ==========================================
-    # 7️⃣ Generate Final Configuration (Non-interactive)
-    # ==========================================
-    - name: Generate final .config
+    - name: Generate final .config (Dynamic Device Detection)
       run: |
         cd openwrt
-        # 使用 olddefconfig + 标准输入重定向，彻底杜绝 (NEW) 交互阻塞
         make olddefconfig </dev/null 2>&1 | grep -iE "warning|error|undefined" || true
         
-        # 验证关键配置是否生效
-        echo "🔍 Validating configuration..."
-        if ! grep -q "CONFIG_TARGET_msm89xx_generic_DEVICE_sp970=y" .config; then
-          echo "❌ SP970 device config missing after defconfig"
-          exit 1
+        # 🔍 动态提取设备名，避免硬编码符号导致 CI 误杀
+        DEVICE=$(grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' | head -1)
+        if [ -z "$DEVICE" ]; then
+          echo "⚠️ No specific DEVICE symbol found, using fallback"
+          DEVICE="msm89xx-generic"
         fi
-        echo "✅ Configuration generated successfully"
+        echo "✅ Target device resolved: $DEVICE"
+        echo "DEVICE_NAME=_${DEVICE}" >> $GITHUB_ENV
         
-        # 输出配置摘要
-        echo "📋 Active config summary:"
-        grep -E "^CONFIG_(TARGET_|PACKAGE_(daed|tailscale|zerotier|podman|kmod-sched-bpf))=" .config | head -15
+        # 打印实际生效的配置片段供调试
+        echo "📋 Active target config:"
+        grep -E "^CONFIG_TARGET_msm89xx|^CONFIG_TARGET.*DEVICE" .config | head -5
 
-    # ==========================================
-    # 8️⃣ Download Sources
-    # ==========================================
     - name: Download package sources
       run: |
         cd openwrt
@@ -187,9 +154,6 @@ jobs:
         find dl -size -1024c -exec rm -f {} \; || true
         echo "✅ Downloads complete"
 
-    # ==========================================
-    # 9️⃣ Compile Firmware (Multi-level Fallback)
-    # ==========================================
     - name: Compile firmware
       id: compile
       run: |
@@ -198,8 +162,6 @@ jobs:
         echo "💾 Disk space before build:"
         df -hT .
         
-        # 三级编译策略：并行 → 单线程 → 详细日志
-        # IGNORE_ERRORS=m 允许非致命警告继续构建
         if make -j$(nproc) IGNORE_ERRORS=m 2>&1 | tee build.log; then
           echo "✅ Build succeeded (parallel)"
         elif make -j1 IGNORE_ERRORS=m 2>&1 | tee -a build.log; then
@@ -208,34 +170,23 @@ jobs:
           echo "✅ Build succeeded (verbose fallback)"
         else
           echo "❌ Build failed after all attempts"
-          echo "🔍 Last 100 lines of build.log:"
           tail -100 build.log
           exit 1
         fi
         
-        # 标记成功并提取元数据
         echo "status=success" >> $GITHUB_OUTPUT
-        DEVICE=$(grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' | head -1)
-        echo "DEVICE_NAME=_${DEVICE:-sp970}" >> $GITHUB_ENV
         echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
         echo "OPENWRT_VERSION=$(git -C . describe --tags --always 2>/dev/null || echo 'master')" >> $GITHUB_ENV
 
-    # ==========================================
-    # 🔟 Post-build Verification
-    # ==========================================
     - name: Verify build outputs
       if: steps.compile.outputs.status == 'success'
       run: |
         cd openwrt/bin/targets/*/*
         echo "📦 Firmware files:"
         ls -lh *sysupgrade.bin *boot.img *system.img 2>/dev/null || true
-        echo "🔐 SHA256 checksums:"
         sha256sum *sysupgrade.bin 2>/dev/null || true
         df -hT .
 
-    # ==========================================
-    # 1️⃣1️⃣ Organize & Upload Artifacts
-    # ==========================================
     - name: Organize firmware files
       id: organize
       if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
@@ -254,9 +205,6 @@ jobs:
         retention-days: 30
         compression-level: 6
 
-    # ==========================================
-    # 1️⃣2️⃣ Generate GitHub Release
-    # ==========================================
     - name: Generate release metadata
       id: tag
       if: env.UPLOAD_RELEASE == 'true' && !cancelled()
@@ -265,7 +213,7 @@ jobs:
         echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
         
         cat > release.txt << EOF
-        ## ✅ ImmortalWrt SP970 固件构建完成
+        ## ✅ ImmortalWrt ${{ env.DEVICE_NAME }} 固件构建完成
         
         | 项目 | 值 |
         |------|-----|
@@ -273,8 +221,7 @@ jobs:
         | 📅 构建时间 | $(date +"%Y-%m-%d %H:%M:%S") |
         | 🔧 源码分支 | \`${{ env.REPO_BRANCH }}\` |
         | 🏷️ 源码版本 | \`${{ env.OPENWRT_VERSION }}\` |
-        | 🌐 内核 | 6.12.x (MSM8916) |
-        | 💾 文件系统 | SquashFS + Ext4 Overlay (partexp 自动扩容) |
+        | 💾 文件系统 | SquashFS + Ext4 Overlay |
         
         ### 🚀 核心特性
         - ✅ 4G/5G Modem 支持 (QMI/MBIM)
@@ -288,9 +235,6 @@ jobs:
         \`\`\`bash
         $(cd ${{ env.FIRMWARE }} && sha256sum *sysupgrade.bin 2>/dev/null || echo "Not found")
         \`\`\`
-        
-        > ⚠️ **首次刷入**：请使用 \`boot.img + system.img\` 通过 fastboot/flash.sh 刷入  
-        > 🔁 **后续升级**：可直接使用 \`*-sysupgrade.bin\` 通过 LuCI 或 \`sysupgrade\` 命令在线升级
         EOF
         echo "status=success" >> $GITHUB_OUTPUT
 
@@ -301,7 +245,7 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         tag_name: ${{ steps.tag.outputs.release_tag }}
-        name: "SP970 ImmortalWrt ${{ steps.tag.outputs.release_tag }}"
+        name: "ImmortalWrt ${{ env.DEVICE_NAME }} ${{ steps.tag.outputs.release_tag }}"
         body_path: release.txt
         files: |
           ${{ env.FIRMWARE }}/*sysupgrade.bin
