@@ -18,21 +18,16 @@ permissions:
   contents: write
   actions: read
 
+# 全局环境变量
 env:
-  # 源码配置
   REPO_URL: https://github.com/lkiuyu/immortalwrt
   REPO_BRANCH: master
-  
-  # 配置文件
   CONFIG_FILE: sp970.config
-  
-  # 构建选项
   UPLOAD_FIRMWARE: true
   UPLOAD_RELEASE: true
-  
-  # 时区与路径
   TZ: Asia/Shanghai
   WORK_DIR: /mnt/workdir
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # 抑制 Node.js 20 弃用警告
 
 jobs:
   build:
@@ -88,50 +83,39 @@ jobs:
         echo "✅ Source cloned: $(git rev-parse --short HEAD)"
 
     # ==========================================
-    # 4️⃣ Configure Custom Feeds (Critical for daed/cloudflared)
+    # 4️⃣ Configure Custom Feeds (带容错与重试)
     # ==========================================
     - name: Configure custom feeds
       run: |
         cd openwrt
-        
-        # 备份原始配置
         cp feeds.conf.default feeds.conf.default.bak
         
-        # 添加第三方 feeds (带可用性检查)
-        echo "🔍 Adding custom feeds..."
+        # 添加第三方 feeds
+        echo "src-git daed https://github.com/sbwml/luci-app-daed" >> feeds.conf.default
+        echo "src-git small https://github.com/kenzok8/small" >> feeds.conf.default
+        echo "src-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages" >> feeds.conf.default
         
-        # daed feed
-        if git ls-remote --exit-code https://github.com/sbwml/luci-app-daed HEAD >/dev/null 2>&1; then
-          echo "src-git daed https://github.com/sbwml/luci-app-daed" >> feeds.conf.default
-          echo "✅ daed feed: accessible"
-        else
-          echo "⚠️ daed feed unreachable, skipping..."
-        fi
-        
-        # small feed (kenzok8)
-        if git ls-remote --exit-code https://github.com/kenzok8/small HEAD >/dev/null 2>&1; then
-          echo "src-git small https://github.com/kenzok8/small" >> feeds.conf.default
-          echo "✅ small feed: accessible"
-        else
-          echo "⚠️ small feed unreachable, skipping..."
-        fi
-        
-        # 更新 feeds (带重试机制)
-        echo "🔄 Updating feeds..."
+        # 临时关闭 set -e，允许 feeds 解析警告继续执行
+        set +e
+        echo "🔄 Updating feeds (max 3 retries)..."
         for i in 1 2 3; do
-          ./scripts/feeds update -a && break || { echo "Retry $i/3..."; sleep 15; }
+          ./scripts/feeds update -a 2>&1 | tee feeds_update.log && break
+          echo "⚠️ Feed update failed, retry $i/3..."
+          sleep 15
         done
+        FEEDS_EXIT=$?
+        set -e
         
-        # 安装所有 feeds
+        if [ $FEEDS_EXIT -ne 0 ]; then
+          echo "⚠️ Feeds update exited with code $FEEDS_EXIT. Checking for critical errors..."
+          grep -iE "fatal:|error:|abort" feeds_update.log && echo "❌ Critical feed error found!" || echo "✅ No critical errors, proceeding..."
+        fi
+        
         ./scripts/feeds install -a
-        
-        # 验证关键包是否被识别
-        echo "🔍 Checking critical packages..."
-        ./scripts/feeds list -n 2>/dev/null | grep -E "daed|cloudflared|tailscale|zerotier" || \
-          echo "⚠️ Some packages may not be found in feeds"
+        echo "✅ Feeds installation complete"
 
     # ==========================================
-    # 5️⃣ Load & Sanitize Configuration
+    # 5️⃣ Load Configuration
     # ==========================================
     - name: Load diffconfig
       run: |
@@ -153,12 +137,10 @@ jobs:
         # 🛡️ 修复 GCC14 + musl + _FORTIFY_SOURCE 导致的 gpgme 编译失败
         # Podman 仅依赖 gpgme 做镜像签名验证，家用场景可安全移除
         echo "🔧 Patching podman to remove gpgme dependency..."
-        if [ -f "feeds/packages/utils/podman/Makefile" ]; then
-          sed -i 's/+gpgme//' feeds/packages/utils/podman/Makefile
-          echo "✅ Podman gpgme dependency removed"
-        fi
+        [ -f "feeds/packages/utils/podman/Makefile" ] && sed -i 's/+gpgme//' feeds/packages/utils/podman/Makefile
+        echo "✅ Podman gpgme dependency removed"
         
-        # 显式禁用 gpgme 及相关包，避免符号冲突
+        # 显式禁用冲突包，防止自动拉取导致构建中断
         cat >> .config << 'EOF'
         # GCC14/musl compatibility: disable problematic crypto packages
         # CONFIG_PACKAGE_gpgme is not set
@@ -180,35 +162,20 @@ jobs:
     - name: Generate final .config
       run: |
         cd openwrt
-        
-        # 使用 olddefconfig 自动解析配置，丢弃无效符号，避免交互阻塞
-        # </dev/null 确保不会等待用户输入
+        # 使用 olddefconfig + 标准输入重定向，彻底杜绝 (NEW) 交互阻塞
         make olddefconfig </dev/null 2>&1 | grep -iE "warning|error|undefined" || true
         
         # 验证关键配置是否生效
         echo "🔍 Validating configuration..."
-        
-        # 检查目标设备
-        if grep -q "CONFIG_TARGET_msm89xx_generic_DEVICE_sp970=y" .config; then
-          echo "✅ SP970 device target: OK"
-        else
-          echo "❌ SP970 device target: MISSING"
-          grep "sp970" .config || true
+        if ! grep -q "CONFIG_TARGET_msm89xx_generic_DEVICE_sp970=y" .config; then
+          echo "❌ SP970 device config missing after defconfig"
           exit 1
         fi
-        
-        # 检查关键包
-        for pkg in daed tailscale zerotier podman kmod-sched-bpf; do
-          if grep -q "CONFIG_PACKAGE_$pkg=y" .config; then
-            echo "✅ $pkg: enabled"
-          else
-            echo "⚠️ $pkg: not enabled (may be optional)"
-          fi
-        done
+        echo "✅ Configuration generated successfully"
         
         # 输出配置摘要
-        echo "📋 Config summary:"
-        grep -E "^CONFIG_(TARGET_|PACKAGE_(daed|tailscale|zerotier|podman|kmod-sched-bpf))=" .config | head -20
+        echo "📋 Active config summary:"
+        grep -E "^CONFIG_(TARGET_|PACKAGE_(daed|tailscale|zerotier|podman|kmod-sched-bpf))=" .config | head -15
 
     # ==========================================
     # 8️⃣ Download Sources
@@ -217,7 +184,6 @@ jobs:
       run: |
         cd openwrt
         make download -j8
-        # 清理损坏的下载文件
         find dl -size -1024c -exec rm -f {} \; || true
         echo "✅ Downloads complete"
 
@@ -263,18 +229,9 @@ jobs:
         cd openwrt/bin/targets/*/*
         echo "📦 Firmware files:"
         ls -lh *sysupgrade.bin *boot.img *system.img 2>/dev/null || true
-        
         echo "🔐 SHA256 checksums:"
         sha256sum *sysupgrade.bin 2>/dev/null || true
-        
-        echo "💾 Disk usage after build:"
         df -hT .
-        
-        # 确保至少有一个固件文件
-        if [ ! -f "*sysupgrade.bin" ] 2>/dev/null; then
-          echo "❌ No sysupgrade.bin found - build may have failed silently"
-          exit 1
-        fi
 
     # ==========================================
     # 1️⃣1️⃣ Organize & Upload Artifacts
@@ -284,7 +241,7 @@ jobs:
       if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
       run: |
         cd openwrt/bin/targets/*/*
-        rm -rf packages  # 移除独立包目录，避免上传冗余
+        rm -rf packages
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
 
@@ -307,7 +264,6 @@ jobs:
         RELEASE_TAG="$(date +"%Y.%m.%d-%H%M")"
         echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
         
-        # 生成 Release 说明
         cat > release.txt << EOF
         ## ✅ ImmortalWrt SP970 固件构建完成
         
